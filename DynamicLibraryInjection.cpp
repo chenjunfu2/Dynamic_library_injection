@@ -55,7 +55,6 @@ BOOL EnbalePrivileges(HANDLE hProcess, PCWCHAR pszPrivilegesName)
 	return FALSE;
 }
 
-
 //通过进程名（带后缀.exe）获取进程ID
 BOOL GetProcessIDByPath(PCWCHAR pName, DWORD *pProcessID)
 {
@@ -88,7 +87,49 @@ BOOL GetProcessIDByPath(PCWCHAR pName, DWORD *pProcessID)
 	return FALSE;
 }
 
-int main(int argc, char *argv[])
+
+BOOL IsDllLoad(PCWCHAR pDllPath, DWORD dwProcessID, HMODULE *pDllModule)
+{
+	if (pDllPath == NULL)
+	{
+		return FALSE;
+	}
+
+	//做一个进程内的模块快照
+recall:
+	HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, dwProcessID);
+	if (hSnapshot == INVALID_HANDLE_VALUE)
+	{
+		if (GetLastError() == ERROR_BAD_LENGTH)//MSDN文档说：出现此错误请重复调用直到成功
+		{
+			Sleep(0);
+			goto recall;
+		}
+
+		return FALSE;
+	}
+
+	//遍历快照找到名称匹配的第一个模块（有多个同名总是选择第一个）
+	MODULEENTRY32W md = { sizeof(md) };
+	for (BOOL ret = Module32FirstW(hSnapshot, &md); ret != FALSE; ret = Module32NextW(hSnapshot, &md))
+	{
+		if (wcscmp(md.szExePath, pDllPath) == 0)
+		{
+			if (pDllModule != NULL)
+			{
+				*pDllModule = md.hModule;//传出
+			}
+
+			CloseHandle(hSnapshot);
+			return TRUE;
+		}
+	}
+
+	CloseHandle(hSnapshot);
+	return FALSE;
+}
+
+int wmain(int argc, wchar_t *argv[])
 {
 	//通过命令行获取信息，第一个是dll路径，第二个是被注入进程的ID
 	if (argc != 3)//3是因为要扣掉第0个自身路径
@@ -99,45 +140,25 @@ int main(int argc, char *argv[])
 	}
 
 	//获取dll路径
-	const char *cpDllPath = argv[1];
-	if (cpDllPath[0] == '\0')
+	const wchar_t *cpDllPath = argv[1];
+	if (cpDllPath[0] == L'\0')
 	{
 		ERR_PRINT(Dll Path);
 		return -1;
 	}
-	SIZE_T szDllNameSize = (strlen(cpDllPath) + 1) * sizeof(*cpDllPath);//加1是为了保留末尾0字符
+	SIZE_T szDllNameSize = (wcslen(cpDllPath) + 1) * sizeof(*cpDllPath);//加1是为了保留末尾0字符
 
 	//获取进程id
 	DWORD dwProcessID;
-	if (sscanf(argv[2], "%ld", &dwProcessID) != 1)
+	if (swscanf(argv[2], L"%ld", &dwProcessID) != 1)
 	{
 		//sscanf失败代表这个有可能是路径
-		//由于进程快照函数强制要求宽字符串，先进行转换
-		int iWideCharSize = MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, argv[2], -1, NULL, 0);//此函数需要二次调用，第一次用于获取实际长度，分配内存块后第二次调用
-		LPWSTR pwcProcessName = (LPWSTR)HeapAlloc(GetProcessHeap(), 0, iWideCharSize);
-		if (pwcProcessName == NULL)
-		{
-			ERR_PRINT(HeapAlloc);
-			return -1;
-		}
-
-		//获取实际内容
-		int iActualLSize = MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, argv[2], -1, pwcProcessName, iWideCharSize);
-		if (iActualLSize != iWideCharSize)
-		{
-			ERR_PRINT(MultiByteToWideChar);
-			return - 1;
-		}
-		
 		//通过快照匹配获取进程id
-		if (GetProcessIDByPath(pwcProcessName, &dwProcessID) == FALSE)
+		if (GetProcessIDByPath(argv[2], &dwProcessID) == FALSE)
 		{
 			ERR_PRINT(Process ID/Name);
 			return -1;
 		}
-
-		//释放内存
-		HeapFree(GetProcessHeap(), 0, pwcProcessName);
 	}
 
 	//获得调试权限（提权）
@@ -173,30 +194,136 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	//启动远程线程加载dll
-	HANDLE hTargetThread = CreateRemoteThread(hTargetProcess, NULL, 0, (LPTHREAD_START_ROUTINE)LoadLibraryA, pProcessMemory, NULL, NULL);
-	if (hTargetThread == NULL)
+	//获得ZwCreateThreadEx函数地址
+	HMODULE hNtDllMd = LoadLibraryW(L"ntdll.dll");//这里是加载模块，所以后面需要closehandle
+	if (hNtDllMd == NULL)
 	{
-		ERR_PRINT(CreateRemoteThread);
+		ERR_PRINT(GetModuleHandleW);
 		return -1;
 	}
 
-	printf("Injection Success.\n");
+	//先定义一下ZwCreateThreadEx函数指针类型
+	typedef DWORD(WINAPI *def_ZwCreateThreadEx)(//x64
+		PHANDLE, 
+		ACCESS_MASK, 
+		LPVOID, 
+		HANDLE, 
+		LPTHREAD_START_ROUTINE, 
+		LPVOID, 
+		ULONG, 
+		SIZE_T, 
+		SIZE_T, 
+		SIZE_T, 
+		LPVOID);
+#define STATUS_SUCCESS 0x0000
+
+	def_ZwCreateThreadEx pZwCreateThreadEx = (def_ZwCreateThreadEx)GetProcAddress(hNtDllMd, "ZwCreateThreadEx");
+	if (pZwCreateThreadEx == NULL)
+	{
+		ERR_PRINT(GetProcAddress);
+		return -1;
+	}
+
+	//获得LoadLibraryW和FreeLibrary函数地址
+	HMODULE hKernel32Md = GetModuleHandleW(L"kernel32.dll");//这里是获取已加载dll的模块句柄，无需closehandle
+	if (hKernel32Md == NULL)
+	{
+		ERR_PRINT(GetModuleHandleW);
+		return -1;
+	}
+
+	LPVOID pLoadLibraryW = GetProcAddress(hKernel32Md, "LoadLibraryW");
+	if (pLoadLibraryW == NULL)
+	{
+		ERR_PRINT(GetProcAddress);
+		return -1;
+	}
+
+	LPVOID pFreeLibrary = GetProcAddress(hKernel32Md, "FreeLibrary");
+	if (pFreeLibrary == NULL)
+	{
+		ERR_PRINT(GetProcAddress);
+		return -1;
+	}
+
+	//启动远程线程加载dll
+	HANDLE hTargetThread = NULL;
+	DWORD dwStatus = pZwCreateThreadEx(&hTargetThread, PROCESS_ALL_ACCESS, NULL, hTargetProcess, (LPTHREAD_START_ROUTINE)pLoadLibraryW, pProcessMemory, 0, 0, 0, 0, NULL);
+	if (hTargetThread == NULL || dwStatus != STATUS_SUCCESS)
+	{
+		ERR_PRINT(ZwCreateThreadEx);
+		return -1;
+	}
 
 	//等待函数退出
 	WaitForSingleObject(hTargetThread, INFINITE);
-	//获取线程退出码
-	DWORD hTargetProcessExitCode;
-	if (GetExitCodeProcess(hTargetProcess, &hTargetProcessExitCode) == FALSE)
+
+	//查看模块是否载入
+	HMODULE hTargetDll = NULL;//目标dll在目标进程内的句柄
+	if (IsDllLoad(cpDllPath, dwProcessID, &hTargetDll))
 	{
-		ERR_PRINT(GetExitCodeProcess);
+		printf("Injection Success.\n");
+	}
+	else
+	{
+		printf("Injection Unsuccess.\n");
+	}
+
+	//获取线程退出码
+	DWORD hTargetThreadExitCode = 0;
+	if (GetExitCodeThread(hTargetThread, &hTargetThreadExitCode) == FALSE)
+	{
+		ERR_PRINT(GetExitCodeThread);
 		return -1;
 	}
 
-	printf("Thread Exit, Code:%d\n", hTargetProcessExitCode);
-
 	//关闭远程线程句柄
 	CloseHandle(hTargetThread);
+
+	printf("LoadLibrary Thread Exit, Code:%d\n", hTargetThreadExitCode);
+
+	putchar('\n');
+	system("pause");//暂停
+	putchar('\n');
+
+	//让远程进程卸载dll
+	if (hTargetDll != NULL)
+	{
+		//启动远程线程释放dll
+		HANDLE hTargetThread = NULL;
+		DWORD dwStatus = pZwCreateThreadEx(&hTargetThread, PROCESS_ALL_ACCESS, NULL, hTargetProcess, (LPTHREAD_START_ROUTINE)pFreeLibrary, (LPVOID)hTargetDll, 0, 0, 0, 0, NULL);
+		if (hTargetThread == NULL || dwStatus != STATUS_SUCCESS)
+		{
+			ERR_PRINT(ZwCreateThreadEx);
+			return -1;
+		}
+
+		//等待函数退出
+		WaitForSingleObject(hTargetThread, INFINITE);
+
+		//查看模块是否卸载
+		if (!IsDllLoad(cpDllPath, dwProcessID, NULL))
+		{
+			printf("Unload Success.\n");
+		}
+		else
+		{
+			printf("Unload Unsuccess.\n");
+		}
+
+		//获取线程退出码
+		DWORD hTargetThreadExitCode = 0;
+		if (GetExitCodeThread(hTargetThread, &hTargetThreadExitCode) == FALSE)
+		{
+			ERR_PRINT(GetExitCodeThread);
+			return -1;
+		}
+
+		//关闭远程线程句柄
+		CloseHandle(hTargetThread);
+
+		printf("FreeLibrary Thread Exit, Code:%d\n", hTargetThreadExitCode);
+	}
 
 	//释放远程进程内存
 	if (VirtualFreeEx(hTargetProcess, pProcessMemory, 0, MEM_RELEASE) == FALSE)
@@ -204,9 +331,11 @@ int main(int argc, char *argv[])
 		ERR_PRINT(VirtualFreeEx);
 		return -1;
 	}
-
+	
 	//关闭远程进程句柄
 	CloseHandle(hTargetProcess);
+	//关闭ntdll.dll
+	CloseHandle(hNtDllMd);
 
 	//安全退出
 	return 0;
