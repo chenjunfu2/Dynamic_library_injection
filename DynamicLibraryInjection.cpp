@@ -335,7 +335,7 @@ int wmain(int argc, wchar_t *argv[])
 	//关闭远程进程句柄
 	CloseHandle(hTargetProcess);
 	//关闭ntdll.dll
-	CloseHandle(hNtDllMd);
+	//CloseHandle(hNtDllMd); 测试发现，这个dll不能被关闭
 
 	//安全退出
 	return 0;
